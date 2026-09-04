@@ -1,0 +1,162 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/oldsj/ollama-queue-proxy
+  pullPolicy: IfNotPresent
+  # Defaults to the chart's appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+
+service:
+  type: ClusterIP
+  port: 11435
+  annotations: {}
+  # Expose configured client-injection listeners here when needed.
+  extraPorts: []
+  # - name: injection-example
+  #   port: 11436
+  #   targetPort: 11436
+
+resources: {}
+
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 2
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+terminationGracePeriodSeconds: 40
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# Add secret-backed auth keys or other environment variables without putting
+# secret values in the ConfigMap.
+extraEnv: []
+# - name: ADMIN_API_KEY
+#   valueFrom:
+#     secretKeyRef:
+#       name: ollama-queue-proxy-auth
+#       key: admin-api-key
+
+extraEnvFrom: []
+
+# Use a pre-existing ConfigMap instead of having this chart render config.yaml.
+# It must contain a config.yaml key.
+existingConfigMap: ""
+
+# Application configuration. The default is usable inside a cluster but is
+# intentionally unauthenticated; enable auth before exposing the Service.
+config:
+  proxy:
+    host: 0.0.0.0
+    port: 11435
+    max_concurrent: 2
+    allow_model_management: false
+    drain_timeout: 30
+    max_request_body_mb: 50
+    max_buffered_request_mb: 256
+    max_response_body_mb: 64
+    max_ingress_concurrent: 32
+    body_read_timeout: 30
+    allow_unauthenticated_public: true
+  ollama:
+    hosts:
+      - url: http://ollama:11434
+        name: primary
+        weight: 1
+        model_sync_interval: 30
+    health_check_interval: 30
+    request_timeout: 300
+  queue:
+    high:
+      max_depth: 50
+      max_wait: 120
+      high_watermark_pct: 80
+    normal:
+      max_depth: 100
+      max_wait: 300
+      high_watermark_pct: 80
+    low:
+      max_depth: 200
+      max_wait: 600
+      high_watermark_pct: 80
+    overflow_status_code: 503
+  webhooks:
+    enabled: false
+    url: ""
+    events:
+      - queue.full
+      - queue.high_watermark
+      - queue.drained
+      - host.unhealthy
+      - host.recovered
+    max_pending: 100
+    max_concurrent: 2
+    delivery_timeout: 5
+  auth:
+    enabled: false
+    keys: []
+    rate_limit:
+      max_failures: 10
+      window_seconds: 60
+      max_sources: 10000
+  logging:
+    level: info
+    format: json
+  client_injection:
+    listeners: []
+    allow_public_injection: false
+  routing:
+    strategy: round_robin
+    fallback: any_healthy
+    model_poll_timeout: 3
+  embedding_cache:
+    enabled: false
+    backend: redis://valkey:6379/0
+    ttl: 86400
+    max_entry_bytes: 32768
+    key_prefix: "oqp:embed:"
+    connect_timeout: 2
+  keep_alive:
+    default: 5m
+    override: false

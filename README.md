@@ -127,6 +127,26 @@ Then point your consumers at `http://localhost:11435` instead of `http://localho
 
 > **Security:** The default listener is loopback-only. Non-loopback binds fail startup unless authentication is enabled or `allow_unauthenticated_public` is explicitly set. The Compose example uses the explicit exception only inside the container and publishes the port on host loopback.
 
+### Kubernetes with Helm
+
+Versioned images and charts are published to GHCR. Create a namespace with the Restricted Pod Security Standard enforced, then install the chart and point it at an Ollama Service:
+
+```bash
+kubectl create namespace ollama-system
+kubectl label namespace ollama-system \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted
+
+helm install ollama-queue-proxy \
+  oci://ghcr.io/oldsj/charts/ollama-queue-proxy \
+  --namespace ollama-system \
+  --version 0.4.0 \
+  --set 'config.ollama.hosts[0].url=http://ollama.default.svc:11434'
+```
+
+The rendered workload meets Restricted PSS by default: it runs as a fixed non-root user, drops all capabilities, disables privilege escalation, uses RuntimeDefault seccomp, mounts a read-only root filesystem, and does not mount a service-account token. The default chart Service is cluster-internal and unauthenticated. Before exposing it, enable `config.auth`, reference key environment variables from Kubernetes Secrets with `extraEnv`, and set `config.proxy.allow_unauthenticated_public=false`. See [`charts/ollama-queue-proxy/values.yaml`](charts/ollama-queue-proxy/values.yaml) for all deployment and application settings.
+
 ---
 
 ## Authentication

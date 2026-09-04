@@ -1,0 +1,6 @@
+ollama-queue-proxy is available inside the cluster at:
+
+  http://{{ include "ollama-queue-proxy.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+The default configuration is unauthenticated. Enable auth before exposing this
+Service outside a trusted cluster network.

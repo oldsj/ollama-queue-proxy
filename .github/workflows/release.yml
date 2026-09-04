@@ -31,10 +31,39 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build and push
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        with:
+          version: v3.18.4
+
+      - name: Package Helm chart
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          chart_version="$(helm show chart charts/ollama-queue-proxy | awk '$1 == "version:" {print $2}')"
+          app_version="$(helm show chart charts/ollama-queue-proxy | awk '$1 == "appVersion:" {gsub(/\"/, "", $2); print $2}')"
+
+          if [[ "$chart_version" != "$release_version" || "$app_version" != "$release_version" ]]; then
+            echo "Chart version ($chart_version), appVersion ($app_version), and release tag ($release_version) must match"
+            exit 1
+          fi
+
+          helm lint charts/ollama-queue-proxy
+          helm package charts/ollama-queue-proxy --destination dist
+
+      - name: Build and push image
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Push Helm chart to GHCR
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+          helm push dist/ollama-queue-proxy-*.tgz "oci://ghcr.io/${owner}/charts"

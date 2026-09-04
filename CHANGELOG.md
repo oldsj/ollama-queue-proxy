@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-04
+
+### Added
+- Helm chart with secure pod defaults, application configuration, secret-backed environment support, and OCI publishing to GHCR on version tags.
+
+### Changed
+- Removed the unnecessary `-hardened` suffix from the Docker Compose image tag; hardening remains part of the standard image and runtime configuration.
+
 ## [0.3.3] - 2026-06-23
 
 ### Fixed
