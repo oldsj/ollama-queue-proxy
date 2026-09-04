@@ -6,12 +6,30 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 if TYPE_CHECKING:
     from ..main import AppState
 
 router = APIRouter()
+
+
+async def _require_observability(request: Request):
+    state: AppState = request.app.state.oqp
+    key_cfg, err = await state.auth_manager.authenticate(request)
+    if err:
+        return None, err
+    if state.config.auth.enabled and (
+        key_cfg is None or not (key_cfg.observability or key_cfg.management)
+    ):
+        return None, JSONResponse(
+            status_code=403,
+            content={
+                "error": "observability permission required",
+                "request_id": getattr(request.state, "request_id", "unknown"),
+            },
+        )
+    return key_cfg, None
 
 
 def _pm_label(v: str) -> str:
@@ -29,7 +47,7 @@ async def queue_status(request: Request):
     state: AppState = request.app.state.oqp
 
     # Auth check (same as any other endpoint when enabled)
-    _, err = await state.auth_manager.authenticate(request)
+    _, err = await _require_observability(request)
     if err:
         return err
 
@@ -57,7 +75,6 @@ async def queue_status(request: Request):
     for host in state.host_manager.hosts:
         hosts_data.append({
             "name": host.name,
-            "url": host.url,
             "healthy": host.healthy,
             "models": host.models,
             "last_checked": host.last_checked.isoformat() if host.last_checked else None,
@@ -102,7 +119,7 @@ async def metrics(request: Request):
     state: AppState = request.app.state.oqp
 
     # Auth mirrors /queue/status
-    _, err = await state.auth_manager.authenticate(request)
+    _, err = await _require_observability(request)
     if err:
         return err
 
@@ -143,6 +160,9 @@ async def metrics(request: Request):
         "# HELP oqp_concurrency_active Current active upstream requests",
         "# TYPE oqp_concurrency_active gauge",
         f"oqp_concurrency_active {q_mgr.active_count()}",
+        "# HELP oqp_buffered_request_bytes Request bytes retained by queued and active work",
+        "# TYPE oqp_buffered_request_bytes gauge",
+        f"oqp_buffered_request_bytes {q_mgr.buffered_body_bytes()}",
     ]
 
     lines += [
@@ -183,6 +203,14 @@ async def metrics(request: Request):
             "# HELP oqp_client_cap_waiting Requests waiting on per-client concurrency cap",
             "# TYPE oqp_client_cap_waiting gauge",
         ]
+        queued = state.queue_manager.client_waiting_counts()
+        cm.set_waiting_counts(
+            {
+                client_id: count
+                for client_id, count in queued.items()
+                if cm.is_at_cap(client_id)
+            }
+        )
         for cid, count in cm.cap_waiting_counts().items():
             lines.append(f'oqp_client_cap_waiting{{client_id="{_pm_label(cid)}"}} {count}')
 

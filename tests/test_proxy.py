@@ -67,16 +67,18 @@ async def test_non_streaming_response_content_length_correct():
     upstream_body = json.dumps(payload).encode() + b"\n"
     upstream_content_length = str(len(upstream_body))  # e.g. "52"
 
-    mock_resp = MagicMock(spec=httpx.Response)
-    mock_resp.status_code = 200
-    mock_resp.headers = httpx.Headers({
-        "content-type": "application/json",
-        "content-length": upstream_content_length,
-    })
-    mock_resp.json.return_value = payload
+    mock_resp = httpx.Response(
+        200,
+        headers={
+            "content-type": "application/json",
+            "content-length": upstream_content_length,
+        },
+        content=upstream_body,
+    )
 
     mock_client = AsyncMock(spec=httpx.AsyncClient)
-    mock_client.request = AsyncMock(return_value=mock_resp)
+    mock_client.build_request = MagicMock(return_value=httpx.Request("POST", "http://upstream"))
+    mock_client.send = AsyncMock(return_value=mock_resp)
 
     cfg = make_config()
     host = OllamaHost(url="http://ollama-test:11434", name="test")
@@ -136,16 +138,18 @@ async def test_chunked_json_response_not_treated_as_streaming():
 
     payload = {"embeddings": [[0.1, 0.2, 0.3]], "model": "bge-m3"}
 
-    mock_resp = MagicMock(spec=httpx.Response)
-    mock_resp.status_code = 200
-    mock_resp.headers = httpx.Headers({
-        "content-type": "application/json; charset=utf-8",
-        "transfer-encoding": "chunked",
-    })
-    mock_resp.json.return_value = payload
+    mock_resp = httpx.Response(
+        200,
+        headers={
+            "content-type": "application/json; charset=utf-8",
+            "transfer-encoding": "chunked",
+        },
+        content=json.dumps(payload).encode(),
+    )
 
     mock_client = AsyncMock(spec=httpx.AsyncClient)
-    mock_client.request = AsyncMock(return_value=mock_resp)
+    mock_client.build_request = MagicMock(return_value=httpx.Request("POST", "http://upstream"))
+    mock_client.send = AsyncMock(return_value=mock_resp)
 
     cfg = make_config()
     host = OllamaHost(url="http://ollama-test:11434", name="test")

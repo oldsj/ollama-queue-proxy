@@ -183,14 +183,14 @@ async def test_capped_batch_does_not_block_interactive():
     ])
 
     # Fill batch client's cap
-    await mgr.acquire("batch")
+    assert mgr.try_acquire("batch")
 
     # Interactive client (unlimited) should still acquire immediately
     interactive_done = False
 
     async def interactive_acquire():
         nonlocal interactive_done
-        await mgr.acquire("interactive")
+        assert mgr.try_acquire("interactive")
         interactive_done = True
 
     import asyncio

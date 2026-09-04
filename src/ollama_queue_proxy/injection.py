@@ -81,11 +81,13 @@ def make_injection_app(inject_as: str, key_cfg: ApiKeyConfig) -> FastAPI:
         else:
             tier = requested_priority
 
+        management_kwargs = {"management": True} if key_cfg.management else {}
         return await _enqueue_request(
             request=request,
             client_id=inject_as,
             tier=tier,
             state=state,
+            **management_kwargs,
         )
 
     return inj_app

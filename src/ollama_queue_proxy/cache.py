@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import redis.asyncio as aioredis
 
@@ -19,10 +20,27 @@ CACHEABLE_PATHS = frozenset({"/api/embed", "/api/embeddings"})
 # Log RESP errors at most once per minute to avoid spam
 _ERROR_LOG_COOLDOWN = 60.0
 
-# Metric counters — updated in-place, read by /metrics
-hits: dict[str, int] = {}    # keyed by (client, model, endpoint)
-misses: dict[str, int] = {}
-errors: dict[str, int] = {}
+class BoundedCounter(dict[str, int]):
+    """A dict-compatible counter that caps attacker-controlled label cardinality."""
+
+    def __init__(self, max_keys: int = 1024, overflow_key: str = "__overflow__") -> None:
+        super().__init__()
+        self.max_keys = max_keys
+        self.overflow_key = overflow_key
+
+    def increment(self, key: str) -> None:
+        if key in self:
+            self[key] += 1
+        elif len(self) < self.max_keys:
+            self[key] = 1
+        else:
+            self[self.overflow_key] = self.get(self.overflow_key, 0) + 1
+
+
+# Metric counters — bounded in-place mappings read by /metrics.
+hits = BoundedCounter(overflow_key="overflow,overflow,overflow")
+misses = BoundedCounter(overflow_key="overflow,overflow,overflow")
+errors = BoundedCounter(max_keys=64)
 
 
 def _canonical_json(obj) -> bytes:
@@ -31,25 +49,61 @@ def _canonical_json(obj) -> bytes:
     )
 
 
-def _cache_key(prefix: str, endpoint_ns: str, model: str, payload) -> str:
+def _cache_key(
+    prefix: str,
+    endpoint_ns: str,
+    model: str,
+    payload,
+    tenant: str | None = None,
+) -> str:
     """Build a cache key from model + normalised payload. No raw content logged."""
-    preimage = model.encode("utf-8") + b"\x00" + _canonical_json(payload)
+    preimage = _canonical_json(
+        {"tenant": tenant or "anon", "model": model, "payload": payload}
+    )
     digest = hashlib.sha256(preimage).hexdigest()[:32]
-    return f"{prefix}v1:{endpoint_ns}:{digest}"
+    return f"{prefix}v2:{endpoint_ns}:{digest}"
 
 
-def _embed_key(prefix: str, model: str, body_data: dict) -> str:
-    """Cache key for /api/embed. Normalises single-string 'input' to list."""
-    raw_input = body_data.get("input", "")
+def _semantic_payload(body_data: dict) -> dict:
+    """Return all semantic fields, excluding only Ollama residency control."""
+    return {key: value for key, value in body_data.items() if key != "keep_alive"}
+
+
+def _embed_key(
+    prefix: str, model: str, body_data: dict, tenant: str | None = None
+) -> str:
+    """Cache key for /api/embed, including every semantic request option."""
+    payload = _semantic_payload(body_data)
+    raw_input = payload.get("input", "")
     if isinstance(raw_input, str):
-        raw_input = [raw_input]
-    return _cache_key(prefix, "embed", model, raw_input)
+        payload["input"] = [raw_input]
+    return _cache_key(prefix, "embed", model, payload, tenant)
 
 
-def _embeddings_key(prefix: str, model: str, body_data: dict) -> str:
+def _embeddings_key(
+    prefix: str, model: str, body_data: dict, tenant: str | None = None
+) -> str:
     """Cache key for /api/embeddings."""
-    prompt = body_data.get("prompt", "")
-    return _cache_key(prefix, "embeddings", model, prompt)
+    return _cache_key(
+        prefix, "embeddings", model, _semantic_payload(body_data), tenant
+    )
+
+
+def _redact_url(url: str) -> str:
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
+def _metric_component(value: str, limit: int = 64) -> str:
+    if len(value) <= limit:
+        return value
+    digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+    return f"{value[:limit]}~{digest}"
 
 
 class EmbeddingCache:
@@ -79,11 +133,11 @@ class EmbeddingCache:
                 socket_connect_timeout=self._cfg.connect_timeout,
             )
             await self._client.ping()
-            logger.info("embedding_cache.connected backend=%s", self._cfg.backend)
+            logger.info("embedding_cache.connected backend=%s", _redact_url(self._cfg.backend))
         except Exception as e:
             print(
                 f"FATAL: embedding cache startup failed — could not connect to "
-                f"'{self._cfg.backend}': {e}. "
+                f"'{_redact_url(self._cfg.backend)}': {type(e).__name__}. "
                 "Fix the backend address or set embedding_cache.enabled: false.",
                 file=sys.stderr,
             )
@@ -94,7 +148,13 @@ class EmbeddingCache:
             await self._client.aclose()
 
     def _metric_key(self, client_id: str | None, model: str, endpoint: str) -> str:
-        return f"{client_id or 'anon'},{model},{endpoint}"
+        return ",".join(
+            (
+                _metric_component(client_id or "anon"),
+                _metric_component(model),
+                _metric_component(endpoint),
+            )
+        )
 
     async def get(
         self,
@@ -110,7 +170,7 @@ class EmbeddingCache:
         if not self._enabled or self._client is None:
             return None
 
-        key = self._build_key(path, body_data, model)
+        key = self._build_key(path, body_data, model, client_id)
         if key is None:
             return None
 
@@ -118,13 +178,13 @@ class EmbeddingCache:
         try:
             value = await self._client.get(key)
             if value is not None:
-                hits[mkey] = hits.get(mkey, 0) + 1
+                hits.increment(mkey)
                 logger.debug(
                     "embedding_cache.hit endpoint=%s model=%s key_suffix=...%s",
                     path, model, key[-8:],
                 )
                 return value
-            misses[mkey] = misses.get(mkey, 0) + 1
+            misses.increment(mkey)
             return None
         except Exception as e:
             self._log_error("get", e)
@@ -152,7 +212,7 @@ class EmbeddingCache:
             )
             return
 
-        key = self._build_key(path, body_data, model)
+        key = self._build_key(path, body_data, model, client_id)
         if key is None:
             return
 
@@ -165,12 +225,14 @@ class EmbeddingCache:
         except Exception as e:
             self._log_error("set", e)
 
-    def _build_key(self, path: str, body_data: dict, model: str) -> str | None:
+    def _build_key(
+        self, path: str, body_data: dict, model: str, client_id: str | None
+    ) -> str | None:
         try:
             if path == "/api/embed":
-                return _embed_key(self._cfg.key_prefix, model, body_data)
+                return _embed_key(self._cfg.key_prefix, model, body_data, client_id)
             elif path == "/api/embeddings":
-                return _embeddings_key(self._cfg.key_prefix, model, body_data)
+                return _embeddings_key(self._cfg.key_prefix, model, body_data, client_id)
             return None
         except Exception:
             return None
@@ -178,7 +240,7 @@ class EmbeddingCache:
     def _log_error(self, op: str, exc: Exception) -> None:
         now = time.monotonic()
         kind = type(exc).__name__
-        errors[kind] = errors.get(kind, 0) + 1
+        errors.increment(kind)
         if now - self._last_error_log >= _ERROR_LOG_COOLDOWN:
             self._last_error_log = now
             logger.warning(

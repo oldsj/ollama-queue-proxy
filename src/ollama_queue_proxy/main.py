@@ -24,7 +24,14 @@ from .hosts import HostManager
 from .middleware import RequestContextMiddleware, get_client_id, parse_priority
 from .openai_compat import is_openai_compat_path, rewrite_path, wrap_response
 from .proxy import dispatch_request, read_body
-from .queue import PriorityQueueManager, QueueFull, QueueItem, QueuePaused, RequestExpired
+from .queue import (
+    PriorityQueueManager,
+    QueueFull,
+    QueueItem,
+    QueuePaused,
+    QueueReservation,
+    RequestExpired,
+)
 from .routes.queue import router as queue_router
 from .routes.status import router as status_router
 from .routing import RoutingTable
@@ -47,6 +54,9 @@ class AppState:
     start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     client_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     shutting_down: bool = False
+    ingress_semaphore: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(1)
+    )
 
 
 def _configure_logging(config: Config) -> None:
@@ -56,16 +66,6 @@ def _configure_logging(config: Config) -> None:
     else:
         fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
     logging.basicConfig(level=level, format=fmt)
-
-
-def _warn_open_binding(config: Config) -> None:
-    if not config.auth.enabled and config.proxy.host == "0.0.0.0":
-        logger.warning(
-            "SECURITY WARNING: auth.enabled is false and proxy is binding to 0.0.0.0. "
-            "Any host that can reach port %d has unauthenticated Ollama access. "
-            "Set auth.enabled: true if exposing beyond localhost.",
-            config.proxy.port,
-        )
 
 
 @asynccontextmanager
@@ -84,13 +84,16 @@ async def lifespan(app: FastAPI):
             print(f"FATAL: {e}", file=sys.stderr)
             sys.exit(1)
 
-    _warn_open_binding(config)
-
     http_client = httpx.AsyncClient()
     host_manager = HostManager(config.ollama)
     auth_manager = AuthManager(config.auth)
-    queue_manager = PriorityQueueManager(config.queue, config.proxy.max_concurrent)
+    queue_manager = PriorityQueueManager(
+        config.queue,
+        config.proxy.max_concurrent,
+        max_buffered_body_bytes=config.proxy.max_buffered_request_mb * 1024 * 1024,
+    )
     webhook_manager = WebhookManager(config.webhooks, http_client)
+    webhook_manager.start()
 
     # Wire webhook events from queue
     async def on_queue_event(event: str, tier: str | None = None, **kwargs):
@@ -134,6 +137,7 @@ async def lifespan(app: FastAPI):
         embedding_cache=embedding_cache,
         concurrency_manager=concurrency_manager,
         client_stats=client_stats,
+        ingress_semaphore=asyncio.Semaphore(config.proxy.max_ingress_concurrent),
     )
     app.state.oqp = state
     set_shared_state(state)  # make available to injection apps
@@ -171,6 +175,7 @@ async def lifespan(app: FastAPI):
         await routing_table.stop()
     if embedding_cache:
         await embedding_cache.close()
+    await webhook_manager.stop()
     await http_client.aclose()
     set_shared_state(None)
     logger.info("shutdown: complete")
@@ -181,6 +186,9 @@ app = FastAPI(
     description="Drop-in HTTP proxy for Ollama with priority queuing, auth, and failover",
     version="0.2.0",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 app.add_middleware(RequestContextMiddleware)
@@ -193,7 +201,13 @@ _KEEP_ALIVE_PATHS = frozenset({
 })
 
 
-def _inject_keep_alive(body: bytes, cfg_default: str, override: bool, max_body_mb: int) -> bytes:
+def _inject_keep_alive(
+    body: bytes,
+    cfg_default: str,
+    override: bool,
+    max_body_mb: int,
+    restrict_override: bool = False,
+) -> bytes:
     """
     Parse JSON body and inject keep_alive if needed.
     Returns the (possibly modified) body. Never logs body content (FLAG E).
@@ -208,9 +222,36 @@ def _inject_keep_alive(body: bytes, cfg_default: str, override: bool, max_body_m
         return body
     if not isinstance(data, dict):
         return body
-    if override or "keep_alive" not in data:
+    if override or restrict_override or "keep_alive" not in data:
         data["keep_alive"] = cfg_default
     return json.dumps(data, separators=(",", ":")).encode("utf-8")
+
+
+async def _read_reserved_body(
+    request: Request,
+    state: AppState,
+    reservation: QueueReservation,
+    request_id: str,
+) -> tuple[bytes, JSONResponse | None]:
+    """Read a request body while guaranteeing reservation cleanup on cancellation."""
+    try:
+        async with state.ingress_semaphore:
+            body, body_err = await asyncio.wait_for(
+                read_body(request, state.config.proxy.max_request_body_mb),
+                timeout=state.config.proxy.body_read_timeout,
+            )
+    except asyncio.TimeoutError:
+        state.queue_manager.release_reservation(reservation)
+        return b"", JSONResponse(
+            status_code=408,
+            content={"error": "request body read timed out", "request_id": request_id},
+        )
+    except BaseException:
+        state.queue_manager.release_reservation(reservation)
+        raise
+    if body_err:
+        state.queue_manager.release_reservation(reservation)
+    return body, body_err
 
 
 async def _enqueue_request(
@@ -220,6 +261,7 @@ async def _enqueue_request(
     state: AppState,
     reentries: int = 0,
     path_override: str | None = None,
+    management: bool = False,
 ) -> JSONResponse:
     """
     Buffer the request body, enqueue it, and await dispatch. Used by both the main
@@ -233,21 +275,79 @@ async def _enqueue_request(
     Per-client concurrency cap is enforced inside dispatch_fn via ClientConcurrencyManager.
     """
     from .cache import CACHEABLE_PATHS
-    from .proxy import extract_model
+    from .proxy import extract_model, model_management_error
 
     request_id = getattr(request.state, "request_id", "unknown")
 
-    body, body_err = await read_body(request, state.config.proxy.max_request_body_mb)
+    path = path_override if path_override is not None else request.url.path
+    management_err = model_management_error(
+        request.method,
+        path,
+        state.config,
+        management=management,
+        request_id=request_id,
+    )
+    if management_err:
+        return management_err
+
+    max_request_bytes = state.config.proxy.max_request_body_mb * 1024 * 1024
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            anticipated_size = int(content_length)
+            if anticipated_size < 0:
+                raise ValueError
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid content-length", "request_id": request_id},
+            )
+        if anticipated_size > max_request_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "request body too large", "request_id": request_id},
+            )
+    else:
+        anticipated_size = max_request_bytes
+
+    try:
+        reservation = await state.queue_manager.reserve(tier, anticipated_size)
+    except QueueFull as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"error": e.reason, "request_id": request_id},
+            headers={"Retry-After": str(state.queue_manager.retry_after(e.tier))},
+        )
+    except QueuePaused as e:
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"queue tier '{e.tier}' is paused", "request_id": request_id},
+        )
+
+    body, body_err = await _read_reserved_body(
+        request, state, reservation, request_id
+    )
     if body_err:
         return body_err
-
     # keep_alive injection — runs before cache check so cached responses also reflect
     # the injected value (though for embeddings keep_alive has no effect upstream)
-    path = path_override if path_override is not None else request.url.path
     ka_cfg = state.config.keep_alive
     if path in _KEEP_ALIVE_PATHS:
         body = _inject_keep_alive(
-            body, ka_cfg.default, ka_cfg.override, state.config.proxy.max_request_body_mb
+            body,
+            ka_cfg.default,
+            ka_cfg.override,
+            state.config.proxy.max_request_body_mb,
+            restrict_override=state.config.auth.enabled and not management,
+        )
+    try:
+        state.queue_manager.resize_reservation(reservation, len(body))
+    except QueueFull as e:
+        state.queue_manager.release_reservation(reservation)
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"error": e.reason, "request_id": request_id},
+            headers={"Retry-After": str(state.queue_manager.retry_after(e.tier))},
         )
 
     # Embedding cache — parsed body and model extracted once, reused for set on miss
@@ -266,6 +366,7 @@ async def _enqueue_request(
                 path, cache_body_data, cache_model, client_id
             )
             if cached is not None:
+                state.queue_manager.release_reservation(reservation)
                 # Cache hit — still track stats, skip queue
                 if client_id:
                     cs = state.client_stats.setdefault(
@@ -286,23 +387,25 @@ async def _enqueue_request(
     conc_mgr = state.concurrency_manager
 
     async def dispatch_fn():
-        # Per-client concurrency cap: acquire slot before upstream, release after
+        return await dispatch_request(
+            request=request,
+            body=body,
+            client_id=client_id,
+            config=state.config,
+            host_manager=state.host_manager,
+            client=state.http_client,
+            routing_table=state.routing_table,
+            path_override=path_override,
+            management=management,
+        )
+
+    def try_acquire() -> bool:
+        return conc_mgr is None or conc_mgr.try_acquire(client_id)
+
+    def release() -> None:
         if conc_mgr is not None:
-            await conc_mgr.acquire(client_id, reentries=reentries)
-        try:
-            return await dispatch_request(
-                request=request,
-                body=body,
-                client_id=client_id,
-                config=state.config,
-                host_manager=state.host_manager,
-                client=state.http_client,
-                routing_table=state.routing_table,
-                path_override=path_override,
-            )
-        finally:
-            if conc_mgr is not None:
-                conc_mgr.release(client_id)
+            conc_mgr.release(client_id)
+        state.queue_manager.wake_workers()
 
     item = QueueItem(
         tier=tier,
@@ -310,11 +413,15 @@ async def _enqueue_request(
         request_id=request_id,
         future=future,
         dispatch_fn=dispatch_fn,
+        client_id=client_id,
+        try_acquire=try_acquire,
+        release=release,
     )
 
     try:
-        position = await state.queue_manager.enqueue(item)
+        position = await state.queue_manager.enqueue(item, reservation=reservation)
     except QueueFull as e:
+        state.queue_manager.release_reservation(reservation)
         retry_after = state.queue_manager.retry_after(e.tier)
         if client_id:
             cs = state.client_stats.setdefault(
@@ -323,16 +430,33 @@ async def _enqueue_request(
             cs["rejected"] = cs.get("rejected", 0) + 1
         return JSONResponse(
             status_code=e.status_code,
-            content={"error": "queue full", "request_id": request_id},
+            content={"error": e.reason, "request_id": request_id},
             headers={"Retry-After": str(retry_after)},
         )
     except QueuePaused as e:
+        state.queue_manager.release_reservation(reservation)
         return JSONResponse(
             status_code=503,
             content={"error": f"queue tier '{e.tier}' is paused", "request_id": request_id},
         )
 
+    async def wait_for_disconnect() -> None:
+        while not future.done():
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(0.1)
+
+    disconnect_task = asyncio.create_task(wait_for_disconnect())
     try:
+        done, _ = await asyncio.wait(
+            {future, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if disconnect_task in done and not future.done():
+            future.cancel()
+            return JSONResponse(
+                status_code=499,
+                content={"error": "client disconnected", "request_id": request_id},
+            )
         response = await future
     except RequestExpired as e:
         return JSONResponse(
@@ -345,6 +469,8 @@ async def _enqueue_request(
             status_code=503,
             content={"error": "upstream error", "request_id": request_id},
         )
+    finally:
+        disconnect_task.cancel()
 
     wait_ms = int((time.monotonic() - enqueue_time) * 1000)
     waited = wait_ms > 0 and position > 1
@@ -366,8 +492,12 @@ async def _enqueue_request(
             await state.embedding_cache.set(
                 path, cache_body_data, cache_model, response.body, client_id
             )
-        except Exception:
-            pass  # never fail a user request due to cache write errors
+        except Exception as e:
+            logger.warning(
+                "cache.write_failed request_id=%s error_type=%s",
+                request_id,
+                type(e).__name__,
+            )
 
     response.headers["X-Queue-Wait-Time"] = str(wait_ms)
     if waited:
@@ -414,6 +544,7 @@ async def proxy_handler(request: Request, path: str):
             tier=tier,
             state=state,
             path_override=native_path,
+            management=bool(key_cfg and key_cfg.management),
         )
         # Only wrap successful JSON responses; pass through errors unchanged
         if isinstance(response, JSONResponse) and response.status_code == 200:
@@ -427,6 +558,7 @@ async def proxy_handler(request: Request, path: str):
         client_id=client_id,
         tier=tier,
         state=state,
+        management=bool(key_cfg and key_cfg.management),
     )
 
 

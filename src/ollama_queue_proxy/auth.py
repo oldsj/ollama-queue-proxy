@@ -6,7 +6,7 @@ import asyncio
 import hmac
 import logging
 import time
-from collections import defaultdict
+from collections import OrderedDict
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -22,9 +22,11 @@ class AuthManager:
     def __init__(self, config: AuthConfig) -> None:
         self._config = config
         # O(1) key lookup — built once at startup
-        self._key_map: dict[str, ApiKeyConfig] = {k.key: k for k in config.keys}
+        self._key_map: dict[str, ApiKeyConfig] = {
+            k.key: k for k in config.keys if k.key is not None
+        }
         # Rate limiting: {ip: [(timestamp, ...), ...]}
-        self._failures: dict[str, list[float]] = defaultdict(list)
+        self._failures: OrderedDict[str, list[float]] = OrderedDict()
         self._lock = asyncio.Lock()
 
     def lookup_key(self, provided: str) -> ApiKeyConfig | None:
@@ -46,7 +48,16 @@ class AuthManager:
 
         client_ip = request.client.host if request.client else "unknown"
 
-        # Check rate limit first
+        auth_header = request.headers.get("Authorization", "")
+        provided_key = auth_header[len("Bearer "):] if auth_header.startswith("Bearer ") else ""
+        key_cfg = self.lookup_key(provided_key) if provided_key else None
+        # Correct credentials always win. Invalid callers sharing a NAT or trusted
+        # reverse proxy address must not be able to lock out valid users.
+        if key_cfg is not None:
+            async with self._lock:
+                self._failures.pop(client_ip, None)
+            return key_cfg, None
+
         if await self._is_rate_limited(client_ip):
             return None, JSONResponse(
                 status_code=429,
@@ -57,33 +68,13 @@ class AuthManager:
                 headers={"Retry-After": str(self._config.rate_limit.window_seconds)},
             )
 
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            await self._record_failure(client_ip)
-            return None, JSONResponse(
-                status_code=401,
-                content={
-                    "error": "missing or invalid authorization header",
-                    "request_id": request.state.request_id,
-                },
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        provided_key = auth_header[len("Bearer "):]
-        key_cfg = self.lookup_key(provided_key)
-        if key_cfg is None:
-            await self._record_failure(client_ip)
-            return None, JSONResponse(
-                status_code=401,
-                content={"error": "invalid api key", "request_id": request.state.request_id},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        # Clear failures on successful auth
-        async with self._lock:
-            self._failures[client_ip].clear()
-
-        return key_cfg, None
+        await self._record_failure(client_ip)
+        error = "invalid api key" if provided_key else "missing or invalid authorization header"
+        return None, JSONResponse(
+            status_code=401,
+            content={"error": error, "request_id": request.state.request_id},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     def enforce_priority_ceiling(self, requested: str, key_cfg: ApiKeyConfig | None) -> str:
         """Cap priority to key's max_priority if auth is enabled and key is present."""
@@ -99,10 +90,18 @@ class AuthManager:
         async with self._lock:
             now = time.monotonic()
             window = self._config.rate_limit.window_seconds
-            recent = [t for t in self._failures[ip] if now - t < window]
-            self._failures[ip] = recent
+            recent = [t for t in self._failures.get(ip, []) if now - t < window]
+            if recent:
+                self._failures[ip] = recent
+                self._failures.move_to_end(ip)
+            else:
+                self._failures.pop(ip, None)
             return len(recent) >= self._config.rate_limit.max_failures
 
     async def _record_failure(self, ip: str) -> None:
         async with self._lock:
-            self._failures[ip].append(time.monotonic())
+            failures = self._failures.setdefault(ip, [])
+            failures.append(time.monotonic())
+            self._failures.move_to_end(ip)
+            while len(self._failures) > self._config.rate_limit.max_sources:
+                self._failures.popitem(last=False)
