@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to publish (for example, v0.4.0)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -22,14 +28,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96  # v5.6.1
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,value=${{ inputs.version || github.ref_name }},pattern={{version}}
+            type=semver,value=${{ inputs.version || github.ref_name }},pattern={{major}}.{{minor}}
 
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
@@ -39,7 +51,8 @@ jobs:
       - name: Package Helm chart
         shell: bash
         run: |
-          release_version="${GITHUB_REF_NAME#v}"
+          release_ref="${{ inputs.version || github.ref_name }}"
+          release_version="${release_ref#v}"
           chart_version="$(helm show chart charts/ollama-queue-proxy | awk '$1 == "version:" {print $2}')"
           app_version="$(helm show chart charts/ollama-queue-proxy | awk '$1 == "appVersion:" {gsub(/\"/, "", $2); print $2}')"
 
@@ -55,6 +68,7 @@ jobs:
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
