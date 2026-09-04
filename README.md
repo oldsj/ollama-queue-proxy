@@ -125,7 +125,7 @@ docker compose up -d
 
 Then point your consumers at `http://localhost:11435` instead of `http://localhost:11434`.
 
-> **Warning:** Default config has no authentication. If exposing beyond localhost, set `auth.enabled: true` and configure API keys. The docker-compose example binds to `127.0.0.1` for this reason.
+> **Security:** The default listener is loopback-only. Non-loopback binds fail startup unless authentication is enabled or `allow_unauthenticated_public` is explicitly set. The Compose example uses the explicit exception only inside the container and publishes the port on host loopback.
 
 ---
 
@@ -137,23 +137,24 @@ Set `auth.enabled: true` and add keys to `config.yml`:
 auth:
   enabled: true
   keys:
-    - key: "sk-my-interactive-key"
+    - key_env: "INTERACTIVE_API_KEY"
       client_id: "openwebui"
       description: "Open WebUI"
       max_priority: high
       management: false
       max_concurrent: 0        # unlimited (subject to proxy.max_concurrent)
-    - key: "sk-my-batch-key"
+    - key_env: "BATCH_API_KEY"
       client_id: "memsearch-watch"
       description: "Background embedding jobs"
       max_priority: low
       max_concurrent: 2        # cap at 2 concurrent so it can't starve interactive users
       management: false
-    - key: "sk-my-admin-key"
+    - key_env: "ADMIN_API_KEY"
       client_id: "admin"
       description: "Admin"
       max_priority: high
       management: true
+      observability: true
 ```
 
 Consumers pass their key as a Bearer token:
@@ -166,9 +167,11 @@ Authorization: Bearer sk-my-interactive-key
 
 **Priority ceilings:** a key with `max_priority: low` that sends `X-Queue-Priority: high` is silently capped to `low`. The caller doesn't know — it just gets queued at its allowed tier.
 
-**Per-client concurrency caps:** `max_concurrent: N` limits a client to N simultaneous in-flight requests. Setting to `0` is unlimited. The cap must be ≤ `proxy.max_concurrent`. Different clients have independent semaphores — a capped batch client never blocks an interactive client.
+**Per-client concurrency caps:** `max_concurrent: N` limits a client to N simultaneous in-flight requests. Setting it to `0` is unlimited. The scheduler skips requests whose client is at its cap, so those requests do not occupy global workers or block interactive traffic.
 
-**Management keys:** only keys with `management: true` can call `/queue/pause`, `/queue/resume`, `/queue/drain`, `/queue/flush`. A regular key calling a management endpoint gets 403, not 401 (authenticated but not authorized).
+**Management keys:** only keys with `management: true` can call queue-management endpoints or use mutating Ollama model/blob APIs. Model mutation also requires `proxy.allow_model_management: true`.
+
+**Observability keys:** `/queue/status` and `/metrics` require `observability: true` or `management: true` when authentication is enabled.
 
 **MCP consumer support:** [jobsearch-mcp](https://github.com/TadMSTR/jobsearch-mcp) and [searxng-mcp](https://github.com/TadMSTR/searxng-mcp) both read `OLLAMA_API_KEY` from their environment and forward it as a Bearer token on all outgoing Ollama requests. Point them at the proxy and set their `OLLAMA_API_KEY` to their assigned key — no code changes required.
 
@@ -248,7 +251,7 @@ embedding_cache:
 
 **Scope:** `/api/embed` and `/api/embeddings` only. `/api/generate` and `/api/chat` are never cached (non-deterministic, large, low repeat rate).
 
-**Cache key:** SHA256 of `model + \0 + canonical_json(input)`, truncated to 32 hex chars. Per-endpoint namespaces prevent cross-endpoint collisions (same text via `/api/embed` and `/api/embeddings` get separate keys — their response shapes differ).
+**Cache key:** SHA256 of tenant identity, model, and the complete canonical semantic request, truncated to 32 hex characters. Only `keep_alive` is excluded. Endpoint namespaces and tenant isolation prevent cross-endpoint and cross-client cache poisoning.
 
 **Startup:** if `enabled: true`, the proxy pings the backend at startup. If unreachable, startup fails fast. After startup, any RESP error degrades gracefully: logged at most once per minute, the cache is bypassed for that request, and no user request fails.
 
@@ -268,7 +271,7 @@ keep_alive:
 
 **Applies to:** `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`.
 
-**Behavior:** if `override: false` and `keep_alive` is absent in the request body, inject `default`. If `override: true`, always replace. Non-JSON bodies and bodies over `max_request_body_mb` pass through untouched.
+**Behavior:** if `override: false` and `keep_alive` is absent in the request body, inject `default`. If `override: true`, always replace. When auth is enabled, non-management clients also receive the configured default so they cannot unload or indefinitely pin shared models. Non-JSON bodies and bodies over `max_request_body_mb` pass through untouched.
 
 ---
 
@@ -390,8 +393,8 @@ Returns full queue state, host health, per-client stats, routing decisions, and 
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /health` | None | Liveness probe — always open |
-| `GET /queue/status` | Token (when enabled) | Full queue, host, client, security state |
-| `GET /metrics` | Token (when enabled) | Prometheus text format |
+| `GET /queue/status` | Observability token | Full queue, host, client, security state |
+| `GET /metrics` | Observability token | Prometheus text format |
 | `POST /api/embed` | Token (when enabled) | Native Ollama embedding endpoint |
 | `POST /v1/embeddings` | Token (when enabled) | OpenAI-compat embedding endpoint (see below) |
 | `POST /queue/pause?tier=low` | Management key | Stop accepting requests for tier |
@@ -451,7 +454,7 @@ All values can be overridden via env vars with `OQP_` prefix and `__` nesting:
 
 ```bash
 OQP_PROXY__PORT=11435
-OQP_OLLAMA__HOSTS__0__URL=http://ollama:11434
+# List entries such as ollama.hosts and auth.keys are configured in YAML.
 OQP_AUTH__ENABLED=true
 OQP_ROUTING__STRATEGY=model_aware
 OQP_EMBEDDING_CACHE__ENABLED=true
@@ -472,11 +475,12 @@ Add a dedicated scraper key — low priority and capped at 1 concurrent so metri
 auth:
   enabled: true
   keys:
-    - key: "sk-my-metrics-key"
+    - key_env: "METRICS_API_KEY"
       client_id: "prometheus-scraper"
       description: "Prometheus metrics scraper"
       max_priority: low
       management: false
+      observability: true
       max_concurrent: 1
 ```
 
@@ -536,11 +540,7 @@ cp config.example.yml config.yml
 ollama-queue-proxy
 ```
 
-Or with an environment variable instead of a config file:
-
-```bash
-OQP_OLLAMA__HOSTS__0__URL=http://localhost:11434 ollama-queue-proxy
-```
+List entries such as `ollama.hosts` and `auth.keys` must be configured in YAML; scalar settings can use `OQP_...__...` environment overrides.
 
 Python 3.11+ required.
 

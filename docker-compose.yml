@@ -1,14 +1,20 @@
 services:
   ollama-queue-proxy:
-    image: ghcr.io/tadmstr/ollama-queue-proxy:latest
+    build: .
+    image: ollama-queue-proxy:0.3.3-hardened
     container_name: ollama-queue-proxy
     user: '1000:1000'
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
     read_only: true
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
     tmpfs:
-      - /tmp
+      - /tmp:size=32m,noexec,nosuid,nodev
     ports:
       # Bind to localhost only — do not expose to LAN without setting auth.enabled: true
       - "127.0.0.1:11435:11435"
@@ -16,8 +22,10 @@ services:
       - ./config.yml:/app/config.yml:ro
     environment:
       - OQP_CONFIG=/app/config.yml
+      # Container must listen on all container interfaces. Host publication remains loopback-only.
+      - OQP_PROXY__HOST=0.0.0.0
+      - OQP_PROXY__ALLOW_UNAUTHENTICATED_PUBLIC=true
       # Override individual values without editing config.yml:
-      # - OQP_OLLAMA__HOSTS__0__URL=http://ollama:11434
     logging:
       driver: "json-file"
       options:

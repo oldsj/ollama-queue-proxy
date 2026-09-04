@@ -2,62 +2,44 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .config import ApiKeyConfig
 
 logger = logging.getLogger(__name__)
 
-# Requests from a capped client that have been deferred this many times are
-# allowed through unconditionally to prevent livelock.
-FAIRNESS_MAX_REENTRIES = 3
-
-
 @dataclass
 class ClientState:
     client_id: str
     cap: int  # 0 = unlimited
-    _semaphore: asyncio.Semaphore | None = field(default=None, repr=False)
     inflight: int = 0
     cap_waiting: int = 0
-
-    def __post_init__(self):
-        if self.cap > 0:
-            self._semaphore = asyncio.Semaphore(self.cap)
 
     @property
     def is_capped(self) -> bool:
         return self.cap > 0
 
-    async def acquire(self) -> None:
-        if self._semaphore is None:
-            self.inflight += 1
-            return
-        self.cap_waiting += 1
-        try:
-            await self._semaphore.acquire()
-        finally:
-            self.cap_waiting = max(0, self.cap_waiting - 1)
+    def try_acquire(self) -> bool:
+        if self.is_capped and self.inflight >= self.cap:
+            return False
         self.inflight += 1
+        return True
 
     def release(self) -> None:
         self.inflight = max(0, self.inflight - 1)
-        if self._semaphore is not None:
-            self._semaphore.release()
 
 
 class ClientConcurrencyManager:
     """
-    Tracks per-client concurrency via async semaphores.
+    Tracks per-client concurrency without making global queue workers wait.
 
     Clients with max_concurrent=0 (unlimited) are tracked for metrics but never blocked.
     Clients with max_concurrent>0 are blocked at the per-client cap, which must be ≤
     proxy.max_concurrent (validated at config load time).
 
-    Fairness: a request that has been deferred FAIRNESS_MAX_REENTRIES times bypasses
-    the semaphore to prevent livelock when a capped client floods its secondary queue.
+    The queue scheduler calls try_acquire before dispatch. Requests at their client
+    cap stay queued, allowing dispatchable requests from other clients to proceed.
     """
 
     def __init__(self, key_configs: list[ApiKeyConfig]) -> None:
@@ -73,28 +55,12 @@ class ClientConcurrencyManager:
             return None
         return self._states.get(client_id)
 
-    async def acquire(self, client_id: str | None, reentries: int = 0) -> None:
-        """
-        Acquire a concurrency slot for client_id.
-
-        If reentries >= FAIRNESS_MAX_REENTRIES, bypass the semaphore (fairness bound).
-        No-op for unknown or unlimited clients.
-        """
+    def try_acquire(self, client_id: str | None) -> bool:
+        """Acquire immediately if the client is below its cap."""
         state = self.get_state(client_id)
         if state is None:
-            return
-        if not state.is_capped:
-            state.inflight += 1
-            return
-        if reentries >= FAIRNESS_MAX_REENTRIES:
-            # Bypass semaphore to prevent livelock
-            state.inflight += 1
-            logger.debug(
-                "concurrency.fairness_bypass client_id=%s reentries=%d",
-                client_id, reentries,
-            )
-            return
-        await state.acquire()
+            return True
+        return state.try_acquire()
 
     def release(self, client_id: str | None) -> None:
         state = self.get_state(client_id)
@@ -114,3 +80,7 @@ class ClientConcurrencyManager:
         if state is None or not state.is_capped:
             return False
         return state.inflight >= state.cap
+
+    def set_waiting_counts(self, counts: dict[str, int]) -> None:
+        for client_id, state in self._states.items():
+            state.cap_waiting = counts.get(client_id, 0)

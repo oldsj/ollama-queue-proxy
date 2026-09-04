@@ -3,29 +3,32 @@
 # Copy this file to config.yml and fill in your values.
 # config.yml is in .gitignore — never commit it with real keys.
 #
-# WARNING: Default config has NO authentication.
-# If exposing beyond localhost, set auth.enabled: true and configure API keys.
-# The docker-compose.yml binds to 127.0.0.1 for this reason.
+# The default listener is loopback-only. Non-loopback use requires authentication
+# unless proxy.allow_unauthenticated_public is explicitly enabled.
 #
 # All values can be overridden via environment variables using OQP_ prefix
 # and __ for nesting. Examples:
 #   OQP_PROXY__PORT=11435
-#   OQP_OLLAMA__HOSTS__0__URL=http://ollama:11434
 #   OQP_AUTH__ENABLED=true
 #   OQP_ROUTING__STRATEGY=model_aware
 #   OQP_EMBEDDING_CACHE__ENABLED=true
 #   OQP_KEEP_ALIVE__DEFAULT=5m
 
 proxy:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 11435
   max_concurrent: 2          # concurrent requests dispatched to Ollama at once.
                              # Set this to match Ollama's OLLAMA_NUM_PARALLEL (default 1 in Ollama;
                              # the proxy default of 2 assumes you've set OLLAMA_NUM_PARALLEL ≥ 2).
                              # Higher values increase throughput but also GPU memory pressure.
-  allow_model_management: false  # block /api/pull, /api/push, /api/delete, /api/create, /api/copy
+  allow_model_management: false  # also requires a key with management: true
   drain_timeout: 30          # seconds to wait for in-flight requests on shutdown
   max_request_body_mb: 50    # reject bodies larger than this before buffering
+  max_buffered_request_mb: 256  # aggregate queued + active request-body budget
+  max_response_body_mb: 64   # cap buffered, non-streaming upstream responses
+  max_ingress_concurrent: 32 # cap simultaneous request-body readers
+  body_read_timeout: 30      # stop slow uploads from holding ingress slots forever
+  allow_unauthenticated_public: false  # explicit exception for non-loopback binds
 
 ollama:
   hosts:
@@ -71,25 +74,29 @@ webhooks:
     - queue.drained
     - host.unhealthy
     - host.recovered
+  max_pending: 100           # bounded, coalescing outbound event queue
+  max_concurrent: 2
+  delivery_timeout: 5
 
 auth:
   enabled: false             # set true to require API keys on all requests
   # WARNING: auth.enabled: true with no keys configured is a fatal startup error.
   keys: []
-  # Example keys (v0.2.0 — includes new max_concurrent field):
-  # - key: "${ADMIN_API_KEY}"       # or hardcode, but use env vars for real deployments
-  #   client_id: "admin"
+  # Use key_env for secrets. Literal ${...} strings are rejected rather than interpolated.
+  # - key_env: "ADMIN_API_KEY"
+#   client_id: "admin"
   #   description: "Admin key — full access"
   #   max_priority: high
-  #   management: true              # required to call /queue/pause, /drain, /flush
+#   management: true              # required to call /queue/pause, /drain, /flush
+#   observability: true           # required for /queue/status and /metrics
   #   max_concurrent: 0            # 0 = unlimited (subject to proxy.max_concurrent)
-  # - key: "${OPENWEBUI_API_KEY}"
+  # - key_env: "OPENWEBUI_API_KEY"
   #   client_id: "openwebui"
   #   description: "Open WebUI — interactive"
   #   max_priority: high
   #   management: false
   #   max_concurrent: 0
-  # - key: "${MEMSEARCH_API_KEY}"
+  # - key_env: "MEMSEARCH_API_KEY"
   #   client_id: "memsearch-watch"
   #   description: "Background embedding re-index jobs"
   #   max_priority: low
@@ -98,6 +105,7 @@ auth:
   rate_limit:
     max_failures: 10         # consecutive auth failures per IP before 429
     window_seconds: 60       # rolling window for failure counting
+    max_sources: 10000       # bound authentication failure tracking memory
 
 logging:
   level: "info"

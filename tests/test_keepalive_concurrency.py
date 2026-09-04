@@ -8,7 +8,7 @@ import json
 import pytest
 
 from ollama_queue_proxy.config import ApiKeyConfig
-from ollama_queue_proxy.concurrency import ClientConcurrencyManager, FAIRNESS_MAX_REENTRIES
+from ollama_queue_proxy.concurrency import ClientConcurrencyManager
 from ollama_queue_proxy.main import _inject_keep_alive
 
 
@@ -80,22 +80,20 @@ def make_key(client_id: str, max_concurrent: int = 0) -> ApiKeyConfig:
     return ApiKeyConfig(key="k", client_id=client_id, max_concurrent=max_concurrent)
 
 
-@pytest.mark.asyncio
-async def test_unlimited_client_never_blocks():
+def test_unlimited_client_never_blocks():
     mgr = ClientConcurrencyManager([make_key("svc", max_concurrent=0)])
     # Should return immediately without blocking
     for _ in range(10):
-        await mgr.acquire("svc")
+        assert mgr.try_acquire("svc")
     assert mgr.inflight_counts()["svc"] == 10
     for _ in range(10):
         mgr.release("svc")
     assert mgr.inflight_counts()["svc"] == 0
 
 
-@pytest.mark.asyncio
-async def test_unknown_client_acquire_no_error():
+def test_unknown_client_acquire_no_error():
     mgr = ClientConcurrencyManager([])
-    await mgr.acquire("ghost")  # must not raise or block
+    assert mgr.try_acquire("ghost")
     mgr.release("ghost")
 
 
@@ -104,82 +102,40 @@ async def test_unknown_client_acquire_no_error():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_capped_client_blocks_nth_request():
+def test_capped_client_rejects_nth_immediate_acquire():
     mgr = ClientConcurrencyManager([make_key("batch", max_concurrent=2)])
 
-    await mgr.acquire("batch")
-    await mgr.acquire("batch")
-    # 3rd acquire should block — test with a timeout to prove it doesn't return immediately
-    blocked = False
-
-    async def try_acquire():
-        nonlocal blocked
-        await mgr.acquire("batch")
-        blocked = True
-
-    task = asyncio.create_task(try_acquire())
-    await asyncio.sleep(0.05)  # give it time to block
-    assert not blocked, "3rd acquire should be blocked at cap=2"
-
+    assert mgr.try_acquire("batch")
+    assert mgr.try_acquire("batch")
+    assert not mgr.try_acquire("batch")
     mgr.release("batch")
-    await asyncio.sleep(0.05)
-    assert blocked, "3rd acquire should unblock after a slot is released"
-    task.cancel()
+    assert mgr.try_acquire("batch")
 
 
-@pytest.mark.asyncio
-async def test_cap_waiting_increments_while_blocked():
+def test_cap_waiting_is_set_by_scheduler():
     mgr = ClientConcurrencyManager([make_key("batch", max_concurrent=1)])
-    await mgr.acquire("batch")  # fill the cap
-
-    acquired = asyncio.Event()
-
-    async def waiter():
-        await mgr.acquire("batch")
-        acquired.set()
-
-    task = asyncio.create_task(waiter())
-    await asyncio.sleep(0.05)
-    assert mgr.cap_waiting_counts()["batch"] >= 1
-
-    mgr.release("batch")
-    await asyncio.sleep(0.05)
-    assert acquired.is_set()
-    task.cancel()
+    mgr.set_waiting_counts({"batch": 2})
+    assert mgr.cap_waiting_counts()["batch"] == 2
 
 
-@pytest.mark.asyncio
-async def test_release_decrements_inflight():
+def test_release_decrements_inflight():
     mgr = ClientConcurrencyManager([make_key("svc", max_concurrent=3)])
-    await mgr.acquire("svc")
-    await mgr.acquire("svc")
+    assert mgr.try_acquire("svc")
+    assert mgr.try_acquire("svc")
     assert mgr.inflight_counts()["svc"] == 2
     mgr.release("svc")
     assert mgr.inflight_counts()["svc"] == 1
 
 
 # ---------------------------------------------------------------------------
-# Fairness bound — bypass after FAIRNESS_MAX_REENTRIES
+# Caps are strict
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_fairness_bypass_after_max_reentries():
+def test_cap_has_no_fairness_bypass():
     mgr = ClientConcurrencyManager([make_key("batch", max_concurrent=1)])
-    await mgr.acquire("batch")  # fill the cap
-
-    # With reentries >= FAIRNESS_MAX_REENTRIES, acquire must NOT block
-    acquired = asyncio.Event()
-
-    async def fairness_acquire():
-        await mgr.acquire("batch", reentries=FAIRNESS_MAX_REENTRIES)
-        acquired.set()
-
-    task = asyncio.create_task(fairness_acquire())
-    await asyncio.sleep(0.05)
-    assert acquired.is_set(), "Fairness bypass should allow past-cap acquire"
-    task.cancel()
+    assert mgr.try_acquire("batch")
+    assert not mgr.try_acquire("batch")
 
 
 # ---------------------------------------------------------------------------
@@ -187,23 +143,12 @@ async def test_fairness_bypass_after_max_reentries():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_different_clients_independent_semaphores():
+def test_different_clients_independent_caps():
     mgr = ClientConcurrencyManager([
         make_key("batch", max_concurrent=1),
         make_key("interactive", max_concurrent=2),
     ])
 
-    await mgr.acquire("batch")  # fill batch cap
-
-    # interactive client should NOT be blocked by batch being at cap
-    interactive_acquired = asyncio.Event()
-
-    async def interactive_acquire():
-        await mgr.acquire("interactive")
-        interactive_acquired.set()
-
-    task = asyncio.create_task(interactive_acquire())
-    await asyncio.sleep(0.05)
-    assert interactive_acquired.is_set(), "Interactive client must not be blocked by batch cap"
-    task.cancel()
+    assert mgr.try_acquire("batch")
+    assert not mgr.try_acquire("batch")
+    assert mgr.try_acquire("interactive")
