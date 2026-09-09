@@ -149,7 +149,7 @@ logging:
 #
 # routing:
 #   strategy: model_aware            # model_aware | round_robin (default: round_robin)
-#   fallback: any_healthy            # when no host has the model loaded: pick any healthy host
+#   fallback: error                  # no matching model: return retryable HTTP 503
 #   model_poll_timeout: 3            # seconds for each /api/tags poll
 
 # ---------------------------------------------------------------------------

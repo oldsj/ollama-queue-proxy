@@ -238,7 +238,7 @@ class ClientInjectionConfig(BaseModel):
 
 class RoutingConfig(BaseModel):
     strategy: Literal["model_aware", "round_robin"] = "round_robin"
-    fallback: Literal["any_healthy"] = "any_healthy"
+    fallback: Literal["any_healthy", "error"] = "any_healthy"
     model_poll_timeout: int = 3
 
     @field_validator("model_poll_timeout")

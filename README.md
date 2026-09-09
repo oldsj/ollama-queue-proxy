@@ -241,7 +241,7 @@ ollama:
 
 routing:
   strategy: model_aware            # model_aware | round_robin
-  fallback: any_healthy            # when no host has the model: pick any healthy host
+  fallback: error                  # return retryable 503 if no host advertises the model
   model_poll_timeout: 3
 ```
 
@@ -335,7 +335,11 @@ ollama:
       name: "fallback"
 ```
 
-On connection failure or timeout, the proxy marks the host unhealthy, logs it, and retries on the next host. The response includes `X-Failover-Host` showing which host handled it.
+On connection failure or timeout, the proxy marks the host unhealthy and logs the exception type. Model-aware failover tries only other hosts advertising the exact requested model, excluding hosts already attempted. Exhaustion returns HTTP 503 with `Retry-After: 5`. The response includes `X-Failover-Host` when a host handles it.
+
+Use `routing.fallback: error` for heterogeneous hosts: a model absent from every reachable host returns 503. The default `any_healthy` retains the legacy initial fallback, but never sends a failed model request to an incompatible retry target. Requests without a model and explicit round-robin routing retain their configured behavior.
+
+`ollama.request_timeout` limits upstream read inactivity, not a whole agent task. Keep it below the client timeout and outer task deadline. Increasing it does not fix an overloaded backend.
 
 Background health checks (`GET /api/tags`) recover unhealthy hosts without a restart.
 

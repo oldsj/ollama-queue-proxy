@@ -150,7 +150,10 @@ class RoutingTable:
                 "routing.invalidated host=%s model=%s", host_name, model
             )
 
-    def pick(self, model: str | None) -> HostRoutingState | None:
+    def pick(
+        self, model: str | None, *, exclude: set[str] | None = None,
+        allow_fallback: bool = True,
+    ) -> HostRoutingState | None:
         """
         Pick a host using the configured strategy.
 
@@ -162,15 +165,20 @@ class RoutingTable:
         strategy = self._routing_cfg.strategy
 
         if strategy == "model_aware" and model:
-            return self._pick_model_aware(model)
+            return self._pick_model_aware(model, exclude or set(), allow_fallback)
         else:
-            result = self._pick_round_robin(list(self._states.values()))
+            result = self._pick_round_robin([
+                state for state in self._states.values()
+                if state.reachable and state.name not in (exclude or set())
+            ])
             if result:
                 self.routing_decisions["round_robin"] += 1
             return result
 
-    def _pick_model_aware(self, model: str) -> HostRoutingState | None:
-        reachable = [s for s in self._states.values() if s.reachable]
+    def _pick_model_aware(
+        self, model: str, exclude: set[str], allow_fallback: bool,
+    ) -> HostRoutingState | None:
+        reachable = [s for s in self._states.values() if s.reachable and s.name not in exclude]
         with_model = [s for s in reachable if model in s.loaded_models]
 
         if with_model:
@@ -181,7 +189,7 @@ class RoutingTable:
 
         # Fall back — no host has the model loaded
         fallback = self._routing_cfg.fallback
-        if fallback == "any_healthy":
+        if allow_fallback and fallback == "any_healthy":
             result = self._pick_round_robin(reachable)
             if result:
                 self.routing_decisions["fallback"] += 1

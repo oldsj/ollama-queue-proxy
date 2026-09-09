@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.4.1]
+
+- Keep model-aware failover on compatible, not-yet-attempted hosts.
+- Add strict `routing.fallback: error` and retry guidance on upstream exhaustion.
+- Log transport exception types and failed streams without replaying partial output.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added

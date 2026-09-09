@@ -211,7 +211,10 @@ async def dispatch_request(
     # Build candidate host list — routing table (model_aware) or HostManager fallback
     def _next_host() -> OllamaHost | None:
         if routing_table is not None:
-            rt_state = routing_table.pick(model)
+            # Never retry a model request on an incompatible backend after failure.
+            rt_state = routing_table.pick(
+                model, exclude=attempted, allow_fallback=not attempted,
+            )
             if rt_state is None:
                 return None
             # Map routing state back to OllamaHost object for failover tracking
@@ -221,7 +224,7 @@ async def dispatch_request(
             return None
         # Default: first healthy host (HostManager order, v0.1.x behaviour)
         for h in host_manager.hosts:
-            if not h.healthy:
+            if not h.healthy or h.name in attempted:
                 continue
             if model and h.models and model not in h.models:
                 continue
@@ -276,10 +279,18 @@ async def dispatch_request(
                 async def close_stream(r=resp):
                     await _close_stream_response(r, completion)
 
-                async def stream_gen(r=resp):
+                async def stream_gen(r=resp, stream_host=host):
                     try:
                         async for chunk in r.aiter_bytes():
                             yield chunk
+                    except httpx.TransportError as exc:
+                        # Headers/data may already be sent. Replaying would duplicate
+                        # generated content or tool calls; leave the stream failed.
+                        logger.warning(
+                            "proxy.stream_failed host=%s request_id=%s error_type=%s",
+                            stream_host.name, request_id, type(exc).__name__,
+                        )
+                        raise
                     finally:
                         # Close the httpx response explicitly — if the client
                         # disconnects mid-stream the generator is abandoned and
@@ -346,10 +357,10 @@ async def dispatch_request(
                     media_type=ct or None,
                 )
 
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
             if resp is not None:
                 await resp.aclose()
-            last_error = str(e)
+            last_error = f"{type(e).__name__}: {e}"
             host_manager.mark_unhealthy(host, last_error)
             if routing_table is not None:
                 # Mark host unreachable in routing table too
@@ -364,5 +375,5 @@ async def dispatch_request(
     return JSONResponse(
         status_code=503,
         content={"error": "all upstream hosts failed", "request_id": request_id},
-        headers={"X-Failover-Exhausted": "true"},
+        headers={"X-Failover-Exhausted": "true", "Retry-After": "5"},
     )

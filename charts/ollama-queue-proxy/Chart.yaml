@@ -2,8 +2,8 @@ apiVersion: v2
 name: ollama-queue-proxy
 description: Priority-queuing, authenticated, multi-host reverse proxy for Ollama
 type: application
-version: 0.4.0
-appVersion: "0.4.0"
+version: 0.4.1
+appVersion: "0.4.1"
 home: https://github.com/oldsj/ollama-queue-proxy
 sources:
   - https://github.com/oldsj/ollama-queue-proxy
